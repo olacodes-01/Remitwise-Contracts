@@ -9,7 +9,7 @@ use soroban_sdk::{
 
 #[allow(dead_code)]
 mod interface {
-    use soroban_sdk::{contractclient, Address, Env, Vec};
+    use soroban_sdk::{contractclient, Address, Env, Symbol, Vec};
 
     /// Shared prefix for the cross-contract epoch arguments every privileged
     /// downstream call now carries.  `(orchestrator, epoch)` is appended to the
@@ -50,7 +50,7 @@ mod interface {
             caller: Address,
             goal_id: u32,
             amount: i128,
-        ) -> i128;
+        );
         fn bump_cross_contract_epoch(env: Env, orchestrator: Address) -> u64;
         fn get_cross_contract_epoch(env: Env) -> u64;
     }
@@ -70,8 +70,8 @@ mod interface {
             epoch: u64,
             caller: Address,
             policy_id: u32,
-        );
-        fn bump_cross_contract_epoch(env: Env, orchestrator: Address);
+        ) -> bool;
+        fn bump_cross_contract_epoch(env: Env, orchestrator: Address) -> u64;
         fn get_cross_contract_epoch(env: Env) -> u64;
     }
 
@@ -206,6 +206,12 @@ const KS_ADDR: Symbol = symbol_short!("KS_ADDR");
 /// Captures critical instance storage before a contract upgrade so state
 /// can be restored if the upgrade fails or produces inconsistent results.
 ///
+/// **Invariant:** Monotonic security counters (e.g. [`actor_epoch`]) are never
+/// restored downward; [`restore_from_snapshot`] enforces `max(current, snapshot)`
+/// so emergency restores cannot revive revoked tokens. Transient guards such as
+/// the execution lock are transaction-scoped and must never be persisted across
+/// an upgrade boundary — [`restore_from_snapshot`] always clears the lock.
+///
 /// Per-executor [`FlowRoute`] entries live in *persistent* storage and are
 /// intentionally excluded here (only the default route, via
 /// `goal_id`/`bill_id`/`policy_id`, is captured) — see [`FlowRoute`].
@@ -228,7 +234,7 @@ pub struct PreUpgradeSnapshot {
     pub bill_payments: Address,
     /// Insurance dependency address.
     pub insurance: Address,
-    /// Execution lock state.
+    /// Execution lock state (diagnostics only; never restored).
     pub execution_locked: bool,
     /// Execution statistics.
     pub stats: ExecutionStats,
@@ -238,7 +244,7 @@ pub struct PreUpgradeSnapshot {
     pub bill_id: u32,
     /// Policy execution parameter ID.
     pub policy_id: u32,
-    /// Current actor epoch.
+    /// Current actor epoch (monotonic; never restored downward).
     pub actor_epoch: u64,
 }
 
@@ -514,6 +520,10 @@ pub enum OrchestratorError {
     /// A route id was zero. Object ids are 1-based, so 0 is never a valid
     /// goal/bill/policy id.
     InvalidRoute = 16,
+    /// A downstream contract rejected or failed during coordinated epoch bump.
+    DownstreamEpochBumpFailed = 17,
+    /// Emergency pause is active.
+    EmergencyPaused = 18,
 }
 
 #[contract]
@@ -972,7 +982,7 @@ impl Orchestrator {
 
         let i_res = interface::InsuranceClient::new(&env, &routing.insurance)
             .try_pay_premium(&orch, &epoch, &executor, &routing.policy_id);
-        let i_ok = matches!(classify_premium(i_res), StepOutcome::Success);
+        let i_ok = matches!(classify_call(i_res), StepOutcome::Success);
 
         let savings = FanOutStepResult {
             step: FlowStep::SavingsGoal,
@@ -1488,12 +1498,26 @@ impl Orchestrator {
             }
         }
         if let Some(addr) = env.storage().instance().get(&symbol_short!("SG_ADDR")) {
-            let _ =
-                interface::SavingsGoalsClient::new(env, &addr).try_bump_cross_contract_epoch(&orch);
+            let client = interface::SavingsGoalsClient::new(env, &addr);
+            if client.try_bump_cross_contract_epoch(&orch).is_err()
+                || !matches!(
+                    client.try_get_cross_contract_epoch(),
+                    Ok(Ok(epoch)) if epoch == expected_epoch
+                )
+            {
+                return Self::fail_downstream_epoch_bump(env, symbol_short!("savings"));
+            }
         }
         if let Some(addr) = env.storage().instance().get(&symbol_short!("BP_ADDR")) {
-            let _ =
-                interface::BillPaymentsClient::new(env, &addr).try_bump_cross_contract_epoch(&orch);
+            let client = interface::BillPaymentsClient::new(env, &addr);
+            if client.try_bump_cross_contract_epoch(&orch).is_err()
+                || !matches!(
+                    client.try_get_cross_contract_epoch(),
+                    Ok(Ok(epoch)) if epoch == expected_epoch
+                )
+            {
+                return Self::fail_downstream_epoch_bump(env, symbol_short!("bills"));
+            }
         }
         if let Some(addr) = env.storage().instance().get(&symbol_short!("INS_ADDR")) {
             let client = interface::InsuranceClient::new(env, &addr);
@@ -1588,6 +1612,10 @@ impl Orchestrator {
             .ok_or(OrchestratorError::Unauthorized)?;
         if caller != owner {
             return Err(OrchestratorError::Unauthorized);
+        }
+        let is_locked: bool = env.storage().instance().get(&EXEC_LOCK).unwrap_or(false);
+        if is_locked {
+            return Err(OrchestratorError::ExecutionLocked);
         }
         let fw_addr: Address = env
             .storage()
@@ -1750,10 +1778,8 @@ impl Orchestrator {
             .instance()
             .set(&symbol_short!("VERSION"), &snapshot.version);
 
-        // Restore execution lock
-        env.storage()
-            .instance()
-            .set(&EXEC_LOCK, &snapshot.execution_locked);
+        // Restore execution lock - never restore a transient guard across upgrade boundary
+        env.storage().instance().set(&EXEC_LOCK, &false);
 
         // Restore stats
         env.storage()
@@ -1771,17 +1797,22 @@ impl Orchestrator {
             .instance()
             .set(&symbol_short!("POL_ID"), &snapshot.policy_id);
 
-        // Restore actor epoch
-        env.storage()
-            .instance()
-            .set(&ACTOR_EPOCH, &snapshot.actor_epoch);
+        // Restore actor epoch - never lower a monotonic security counter
+        let current_epoch = Self::get_actor_epoch(&env);
+        let restored_epoch = if snapshot.actor_epoch > current_epoch {
+            snapshot.actor_epoch
+        } else {
+            current_epoch
+        };
+        env.storage().instance().set(&ACTOR_EPOCH, &restored_epoch);
 
         // Consume the snapshot
         env.storage().persistent().remove(&SNAPSHOT_KEY);
+        env.storage().persistent().remove(&symbol_short!("SNAP_TS"));
 
         env.events().publish(
             (symbol_short!("orch"), symbol_short!("snap_rst")),
-            snapshot.version,
+            restored_epoch,
         );
         Ok(true)
     }
@@ -1806,6 +1837,7 @@ impl Orchestrator {
             return Err(OrchestratorError::Unauthorized);
         }
         env.storage().persistent().remove(&SNAPSHOT_KEY);
+        env.storage().persistent().remove(&symbol_short!("SNAP_TS"));
         env.events()
             .publish((symbol_short!("orch"), symbol_short!("snap_dsc")), ());
         Ok(true)
